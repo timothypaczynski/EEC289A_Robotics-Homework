@@ -72,6 +72,9 @@ def default_config() -> config_dict.ConfigDict:
                 lin_vel_z=-0.5,
                 ang_vel_xy=-0.05,
                 orientation=-5.0,
+                # # updated to ensure strafing without falling
+                # orientation=-15.0,   # was -5.0
+                # ang_vel_xy=-0.5,     # was -0.05
                 dof_pos_limits=-1.0,
                 pose=0.5,
                 termination=-1.0,
@@ -85,6 +88,8 @@ def default_config() -> config_dict.ConfigDict:
                 feet_height=-0.2,
                 feet_slip=-0.1,
                 feet_air_time=0.1,
+                # #added term for tracking y-movement.
+                # tracking_lat_vel=1.0,
             ),
             tracking_sigma=0.25,
             max_foot_height=0.1,
@@ -103,8 +108,11 @@ def default_config() -> config_dict.ConfigDict:
             b=[0.9, 0.25, 0.5],
             # Stage metadata is injected from configs/course_config.json.
             stage_name="stage_1",
+            #this stuff all seems pretty irrelevant so I changed it back. 
+            #changed yaw sampling to 0.6 from 0.4.
             student_stage2_goal_min=[-1.0, -0.4, -1.0],
             student_stage2_goal_max=[1.0, 0.4, 1.0],
+            #changed to sample vy more from .25 to .75
             student_stage2_goal_b=[0.9, 0.25, 0.5],
         ),
         impl="jax",
@@ -189,6 +197,10 @@ class Joystick(go2_base.Go2Env):
         self._student_stage2_goal_max = jp.array(self._config.command_config.student_stage2_goal_max)
         self._student_stage2_goal_b = jp.array(self._config.command_config.student_stage2_goal_b)
 
+        print(f"[DEBUG] stage: {self._command_stage_name}")
+        print(f"[DEBUG] goal_min: {self._student_stage2_goal_min}")
+        print(f"[DEBUG] goal_max: {self._student_stage2_goal_max}")
+        print(f"[DEBUG] goal_b: {self._student_stage2_goal_b}")
     def reset(self, rng: jax.Array) -> mjx_env.State:
         qpos = self._init_q
         qvel = jp.zeros(self.mjx_model.nv)
@@ -410,6 +422,10 @@ class Joystick(go2_base.Go2Env):
             "stand_still": self._cost_stand_still(info["command"], data.qpos[7:]),
             "termination": self._cost_termination(done),
             "pose": self._reward_pose(data.qpos[7:]),
+            # updated for more hipmovement
+            #"pose": self._reward_pose(data.qpos[7:], info["command"]),
+            #specific reward implemented for y-direction movement
+            #"tracking_lat_vel": self._reward_tracking_lat_vel(info["command"], self.get_global_linvel(data)),
             "torques": self._cost_torques(data.actuator_force),
             "action_rate": self._cost_action_rate(action, info["last_act"], info["last_last_act"]),
             "energy": self._cost_energy(data.qvel[6:], data.actuator_force),
@@ -425,6 +441,24 @@ class Joystick(go2_base.Go2Env):
     def _reward_tracking_lin_vel(self, commands: jax.Array, local_vel: jax.Array) -> jax.Array:
         lin_vel_error = jp.sum(jp.square(commands[:2] - local_vel[:2]))
         return jp.exp(-lin_vel_error / self._config.reward_config.tracking_sigma)
+
+
+    # # this was implemented to try and encourage strafing.
+    # def _reward_tracking_lat_vel(self, commands: jax.Array, global_vel: jax.Array) -> jax.Array:
+    # # Use global frame so leaning can't fake lateral velocity
+    #     lat_vel_error = jp.square(commands[1] - global_vel[1])
+    #     return jp.exp(-lat_vel_error / self._config.reward_config.tracking_sigma)
+
+
+
+    #this change caused to much destablization I think"
+    
+    # #rewritten so that vy is not ignored.
+    # def _reward_tracking_lin_vel(self, commands: jax.Array, local_vel: jax.Array) -> jax.Array:
+    #     error = commands[:2] - local_vel[:2]
+    #     weights = jp.array([1.0, 3.0])  # amplify vy error so it can't be ignored
+    #     weighted_error = jp.sum(jp.square(error) * weights)
+    #     return jp.exp(-weighted_error / self._config.reward_config.tracking_sigma)
 
     def _reward_tracking_ang_vel(self, commands: jax.Array, ang_vel: jax.Array) -> jax.Array:
         ang_vel_error = jp.square(commands[2] - ang_vel[2])
@@ -455,7 +489,11 @@ class Joystick(go2_base.Go2Env):
     def _reward_pose(self, qpos: jax.Array) -> jax.Array:
         weight = jp.array([1.0, 1.0, 0.1] * 4)
         return jp.exp(-jp.sum(jp.square(qpos - self._default_pose) * weight))
-
+    # "changed to allow hip abductor motion"
+    # def _reward_pose(self, qpos: jax.Array, commands: jax.Array) -> jax.Array:
+    #     weight = jp.array([1.0, 1.0, 0.1] * 4)
+    #     pose_reward = jp.exp(-jp.sum(jp.square(qpos - self._default_pose) * weight))
+    #     return pose_reward * (jp.linalg.norm(commands) < 0.1)
     # --- Smoothness and efficiency ----------------------------------------
 
     def _cost_torques(self, torques: jax.Array) -> jax.Array:
@@ -565,9 +603,33 @@ class Joystick(go2_base.Go2Env):
         2. widen the stage_2 sampling range toward `self._student_stage2_goal_*`
         3. increase the probability of non-zero `vy` and `yaw_rate` commands
         """
-        del current_command
-        return self._cmd_min, self._cmd_max, self._cmd_b
 
+        #this needs to be updated to show the correct sampling profile.
+        # del current_command
+        # return self._cmd_min, self._cmd_max, self._cmd_b
+        
+        "this apporach was to aggressive"
+        del current_command
+        return (
+            self._student_stage2_goal_min,
+            self._student_stage2_goal_max,
+            self._student_stage2_goal_b,)
+
+        "issues with slowly learning in the time frame"
+        "potentially an issues with progress"
+        # Measure how much the current command is already using lateral/yaw
+        # Use this as a proxy for training progress
+        # lateral_activity = jp.abs(current_command[1])  # vy
+        # yaw_activity = jp.abs(current_command[2])       # yaw_rate
+        # progress = jp.clip((lateral_activity + yaw_activity) / 0.5, 0.0, 1.0)
+
+        # # Blend from stage 1 baseline toward stage 2 goal
+        # cmd_min = self._cmd_min + progress * (self._student_stage2_goal_min - self._cmd_min)
+        # cmd_max = self._cmd_max + progress * (self._student_stage2_goal_max - self._cmd_max)
+        # cmd_b   = self._cmd_b   + progress * (self._student_stage2_goal_b   - self._cmd_b)
+
+        # return cmd_min, cmd_max, cmd_b
+  
     def sample_command(self, rng: jax.Array, current_command: jax.Array) -> jax.Array:
         rng, y_rng, w_rng, z_rng = jax.random.split(rng, 4)
         cmd_min, cmd_max, cmd_keep_prob = self._command_sampling_profile(current_command)
