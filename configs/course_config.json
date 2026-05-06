@@ -85,7 +85,7 @@
     "student_stage2_goal": {
       "command_range": {
         "min": [
-          -2.0,
+          -1.0,
           -0.4,
           -1.0
         ],
